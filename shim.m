@@ -1,5 +1,7 @@
 // MLXLCShim: LiveContainer tweak that points MeloNX's RAM donor lookup at the
 // helper extension embedded in LiveContainer's own app bundle.
+// LiveContainer fakes the executable path and NSBundle.mainBundle for guest
+// apps, so the host app is found by scanning every loaded image instead.
 // Logs are prefixed with [MLXLCShim] and land in MeloNX's log output.
 
 #import <Foundation/Foundation.h>
@@ -30,13 +32,53 @@ static NSString *MLXHelperIDInAppDir(NSString *appDir)
     return nil;
 }
 
-static NSString *MLXHostHelperID(void)
+static void MLXAddAppDirForPath(NSString *path, NSMutableOrderedSet<NSString *> *dirs)
 {
-    static NSString *found;
+    if (!path.length || [path hasPrefix:@"/System/"] || [path hasPrefix:@"/usr/"])
+    {
+        return;
+    }
+
+    NSRange range = [path rangeOfString:@".app" options:NSBackwardsSearch];
+
+    // only accept ".app" as a whole path component
+    while (range.location != NSNotFound)
+    {
+        NSUInteger end = range.location + range.length;
+
+        if (end == path.length || [path characterAtIndex:end] == '/')
+        {
+            [dirs addObject:[path substringToIndex:end]];
+            return;
+        }
+
+        if (range.location == 0)
+        {
+            return;
+        }
+
+        range = [path rangeOfString:@".app" options:NSBackwardsSearch range:NSMakeRange(0, range.location)];
+    }
+}
+
+// Every helper ID found in any app directory we can see (host and guest).
+static NSArray<NSString *> *MLXAllHelperIDs(void)
+{
+    static NSArray<NSString *> *ids;
     static dispatch_once_t once;
 
     dispatch_once(&once, ^{
-        NSMutableArray<NSString *> *appDirs = [NSMutableArray array];
+        NSMutableOrderedSet<NSString *> *dirs = [NSMutableOrderedSet orderedSet];
+
+        for (uint32_t i = 0; i < _dyld_image_count(); i++)
+        {
+            const char *name = _dyld_get_image_name(i);
+
+            if (name)
+            {
+                MLXAddAppDirForPath([NSString stringWithUTF8String:name], dirs);
+            }
+        }
 
         uint32_t size = 0;
         _NSGetExecutablePath(NULL, &size);
@@ -47,18 +89,10 @@ static NSString *MLXHostHelperID(void)
 
             if (_NSGetExecutablePath(buffer, &size) == 0)
             {
-                NSString *exe = [[NSString stringWithUTF8String:buffer] stringByResolvingSymlinksInPath];
-                [appDirs addObject:exe.stringByDeletingLastPathComponent];
+                MLXAddAppDirForPath([[NSString stringWithUTF8String:buffer] stringByResolvingSymlinksInPath], dirs);
             }
 
             free(buffer);
-        }
-
-        NSString *arg0 = NSProcessInfo.processInfo.arguments.firstObject;
-
-        if (arg0.length)
-        {
-            [appDirs addObject:arg0.stringByDeletingLastPathComponent];
         }
 
         CFBundleRef mainBundle = CFBundleGetMainBundle();
@@ -66,36 +100,46 @@ static NSString *MLXHostHelperID(void)
 
         if (mainURL)
         {
-            [appDirs addObject:((__bridge NSURL *)mainURL).path];
+            MLXAddAppDirForPath(((__bridge NSURL *)mainURL).path, dirs);
             CFRelease(mainURL);
         }
 
-        for (NSString *dir in appDirs)
+        NSMutableArray<NSString *> *found = [NSMutableArray array];
+
+        for (NSString *dir in dirs)
         {
             NSString *identifier = MLXHelperIDInAppDir(dir);
             NSLog(@"[MLXLCShim] looked in %@, helper: %@", dir, identifier ?: @"none");
 
-            if (identifier)
+            if (identifier && ![found containsObject:identifier])
             {
-                found = identifier;
-                break;
+                [found addObject:identifier];
             }
         }
+
+        ids = found;
     });
 
-    return found;
+    return ids;
 }
 
 static id (*originalLookup)(id, SEL, NSString *, NSError **);
 
 static id hookedLookup(id self, SEL _cmd, NSString *identifier, NSError **error)
 {
-    NSString *host = MLXHostHelperID();
-
-    if (host && [identifier containsString:@"RamDonor"] && ![identifier isEqualToString:host])
+    if ([identifier containsString:@"RamDonor"])
     {
-        NSLog(@"[MLXLCShim] redirecting %@ -> %@", identifier, host);
-        identifier = host;
+        // MeloNX asks for its own (unregistered) helper. Swap in a helper
+        // that belongs to a different app bundle, i.e. LiveContainer's.
+        for (NSString *candidate in MLXAllHelperIDs())
+        {
+            if (![candidate isEqualToString:identifier])
+            {
+                NSLog(@"[MLXLCShim] redirecting %@ -> %@", identifier, candidate);
+                identifier = candidate;
+                break;
+            }
+        }
     }
 
     return originalLookup(self, _cmd, identifier, error);
