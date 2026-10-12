@@ -1,0 +1,58 @@
+name: Build RamDonor for LiveContainer
+
+on:
+  workflow_dispatch:
+    inputs:
+      lc_ipa_url:
+        description: "Direct download link to the LiveContainer .ipa to modify"
+        required: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download LiveContainer IPA
+        env:
+          LC_URL: ${{ inputs.lc_ipa_url }}
+        run: curl -L --fail -o lc.ipa "$LC_URL"
+
+      - name: Unpack and read bundle ID
+        run: |
+          mkdir work
+          unzip -q lc.ipa -d work
+          APP=$(ls -d work/Payload/*.app | head -n1)
+          LC_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist")
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "LC_ID=$LC_ID" >> "$GITHUB_ENV"
+          echo "LiveContainer bundle ID: $LC_ID"
+
+      - name: Build helper extension and add it to the app
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APPEX="$APP/PlugIns/RamDonor.appex"
+          mkdir -p "$APPEX"
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0 -isysroot "$SDK" \
+            -fmodules -fobjc-arc -fapplication-extension \
+            -framework Foundation -e _NSExtensionMain \
+            -Xlinker -rpath -Xlinker @executable_path/Frameworks \
+            -Xlinker -rpath -Xlinker @executable_path/../../Frameworks \
+            main.m -o "$APPEX/RamDonor"
+          sed "s/__BUNDLE_ID__/${LC_ID}.RamDonor/" RamDonor-Info.plist > "$APPEX/Info.plist"
+          codesign -f -s - "$APPEX"
+
+      - name: Build tweak and repack IPA
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir out
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0 -isysroot "$SDK" \
+            -fobjc-arc -dynamiclib -framework Foundation \
+            -install_name @rpath/MLXLCShim.dylib shim.m -o out/MLXLCShim.dylib
+          codesign -f -s - out/MLXLCShim.dylib
+          (cd work && zip -qry ../out/LiveContainer-RamDonor.ipa Payload)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramdonor-output
+          path: out/
